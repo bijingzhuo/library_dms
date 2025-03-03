@@ -101,42 +101,33 @@ def add_book(conn, employee_id):
     publishyear = input("Enter Publish Year: ").strip()
     status = "Available"  # 新书默认状态为 Available
     try:
-        # 插入新书记录
+        # 插入新的书籍记录
         cur.execute("""
             INSERT INTO public.book (isbn, title, publishyear, status, employeeid, createdat, updatedat)
             VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
         """, (isbn, title, publishyear, status, employee_id))
         
-        # 提示输入作者名称（逗号分隔）
-        author_names_input = input("Enter one or more Author Names (comma separated) for this book: ").strip()
-        # 提示输入类别名称（逗号分隔）
-        category_names_input = input("Enter one or more Category Names (comma separated) for this book: ").strip()
-        
-        # 确保至少输入一个作者或类别
-        if not author_names_input and not category_names_input:
-            conn.rollback()
-            print("Failed to add new book: Each book must have at least one author or category!")
-            return
-        
-        # 处理作者：对每个作者名称进行检查或创建，并在 book_author 中建立关联
-        if author_names_input:
-            author_names = [name.strip() for name in author_names_input.split(',') if name.strip()]
-            for author_name in author_names:
-                author_id = get_or_create_author(conn, cur, author_name, employee_id)
-                cur.execute("INSERT INTO public.book_author (isbn, authorid) VALUES (%s, %s)", (isbn, author_id))
-        
-        # 处理类别：对每个类别名称进行检查或创建，并在 book_category 中建立关联
-        if category_names_input:
-            category_names = [name.strip() for name in category_names_input.split(',') if name.strip()]
-            for category_name in category_names:
-                category_id = get_or_create_category(conn, cur, category_name, employee_id)
-                cur.execute("INSERT INTO public.book_category (isbn, categoryid) VALUES (%s, %s)", (isbn, category_id))
+        # 提示输入影本数量
+        num_copies_str = input("Enter number of copies for this book: ").strip()
+        try:
+            num_copies = int(num_copies_str)
+        except ValueError:
+            print("Invalid number input. Defaulting to 1 copy.")
+            num_copies = 1
+
+        # 插入对应数量的影本记录，状态默认 'Available'
+        for _ in range(num_copies):
+            cur.execute("""
+                INSERT INTO public.bookcopy (isbn, status, createdat, updatedat)
+                VALUES (%s, 'Available', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """, (isbn,))
         
         conn.commit()
-        print("New book and its associations added successfully.\n")
+        print("New book and its copies added successfully.\n")
     except Exception as e:
         conn.rollback()
         print("Failed to add new book:", e)
+
 
 def employee_menu(conn, employee_id):
     while True:
@@ -230,7 +221,8 @@ def borrow_book(conn, member_id):
     print("\n=== Borrow a Book ===")
     # 检查会员是否已有未归还的借阅
     cur.execute("""
-        SELECT borrowid FROM public.borrow 
+        SELECT borrowid 
+        FROM public.borrow 
         WHERE memberid = %s AND returndate IS NULL
     """, (member_id,))
     active_borrow = cur.fetchone()
@@ -246,26 +238,21 @@ def borrow_book(conn, member_id):
     if not book:
         print("Book does not exist.")
         return
-    # 仅当书籍状态为 'Available' 时允许直接借阅
     if book[0] != "Available":
         print("Book is not available for borrowing.")
         return
-
+    
     try:
-        # 插入借阅记录：借书日期为当前时间，到期日为当前日期+30天，归还日期为空
+        # 插入借阅记录，并利用触发器自动分配一个可用影本
         cur.execute("""
             INSERT INTO public.borrow 
             (memberid, isbn, borrowdate, duedate, returndate, createdat, updatedat)
             VALUES (%s, %s, CURRENT_TIMESTAMP, CURRENT_DATE + 30, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            RETURNING borrowid, copyid
         """, (member_id, isbn))
-        # 更新书籍状态为 'Borrowed'
-        cur.execute("""
-            UPDATE public.book 
-            SET status = 'Borrowed', updatedat = CURRENT_TIMESTAMP
-            WHERE isbn = %s
-        """, (isbn,))
+        result = cur.fetchone()
         conn.commit()
-        print("Book borrowed successfully.")
+        print(f"Book borrowed successfully. Borrow ID: {result[0]}, Assigned Copy ID: {result[1]}")
     except Exception as e:
         conn.rollback()
         print("Failed to borrow book:", e)
@@ -273,49 +260,33 @@ def borrow_book(conn, member_id):
 def return_book(conn, member_id):
     cur = conn.cursor()
     print("\n=== Return a Book ===")
-    # 查找该会员未归还的借阅记录
+    # 查询会员未归还的借阅记录，取回 copyid 便于后续调试信息显示
     cur.execute("""
-        SELECT borrowid, isbn FROM public.borrow
+        SELECT borrowid, isbn, copyid 
+        FROM public.borrow
         WHERE memberid = %s AND returndate IS NULL
     """, (member_id,))
     borrow_record = cur.fetchone()
     if not borrow_record:
         print("You do not have any borrowed book to return.")
         return
-    borrowid, isbn = borrow_record
+    borrowid, isbn, copyid = borrow_record
     try:
-        # 更新借阅记录，将归还日期设置为当前时间
+        # 更新借阅记录的归还时间，触发器会自动将对应影本状态恢复为 Available，
+        # 并更新 Book 表整体状态
         cur.execute("""
             UPDATE public.borrow
             SET returndate = CURRENT_TIMESTAMP, updatedat = CURRENT_TIMESTAMP
             WHERE borrowid = %s
+            RETURNING copyid
         """, (borrowid,))
-        # 检查该书是否存在队列第一的有效预约记录
-        cur.execute("""
-            SELECT reservationid FROM public.reservation
-            WHERE isbn = %s AND status = 'Active' AND queuenumber = 1
-        """, (isbn,))
-        reservation = cur.fetchone()
-        if reservation:
-            # 如果存在，则将书籍状态更新为 'Reserved'
-            cur.execute("""
-                UPDATE public.book
-                SET status = 'Reserved', updatedat = CURRENT_TIMESTAMP
-                WHERE isbn = %s
-            """, (isbn,))
-        else:
-            # 否则更新书籍状态为 'Available'
-            cur.execute("""
-                UPDATE public.book
-                SET status = 'Available', updatedat = CURRENT_TIMESTAMP
-                WHERE isbn = %s
-            """, (isbn,))
+        returned_copy = cur.fetchone()[0]
         conn.commit()
-        print("Book returned successfully.")
+        print(f"Book returned successfully. Copy ID {returned_copy} is now available.")
     except Exception as e:
         conn.rollback()
         print("Failed to return book:", e)
-
+        
 # 更新后的 Member 菜单（仅显示修改部分）
 def member_menu(conn, member_id):
     while True:
