@@ -233,6 +233,24 @@ def add_book(conn, employee_id):
     except Exception as e:
         conn.rollback()
         print("Failed to auto-assign reservations:", e)
+    try:
+        cur.execute("""
+            SELECT COUNT(*)
+            FROM public.bookcopy
+            WHERE isbn = %s AND status = 'Available'
+        """, (isbn,))
+        available_count = cur.fetchone()[0]
+        new_status = 'Available' if available_count > 0 else 'Unavailable'
+        cur.execute("""
+            UPDATE public.book
+            SET status = %s, updatedat = CURRENT_TIMESTAMP
+            WHERE isbn = %s
+        """, (new_status, isbn))
+        conn.commit()
+        print(f"Book status updated to '{new_status}' based on available copies.")
+    except Exception as e:
+        conn.rollback()
+        print("Failed to update book status:", e)
 
 def employee_menu(conn, employee_id):
     while True:
@@ -244,8 +262,8 @@ def employee_menu(conn, employee_id):
         print("5. Browse Borrow Records")
         print("6. Browse Reservation Records")
         print("7. Browse Book Copies")
-        # 去除了取消预约的功能
-        print("8. Logout")
+        print("8. Update Book Information")
+        print("9. Logout")
         choice = input("Enter your choice: ").strip()
         if choice == "1":
             browse_books(conn)
@@ -262,12 +280,12 @@ def employee_menu(conn, employee_id):
         elif choice == "7":
             browse_book_copies(conn)
         elif choice == "8":
+            update_book_info(conn, employee_id)
+        elif choice == "9":
             print("Logging out...\n")
             break
         else:
             print("Invalid choice. Please try again.")
-
-
 
 def reserve_book(conn, member_id):
     cur = conn.cursor()
@@ -293,6 +311,16 @@ def reserve_book(conn, member_id):
     """, (member_id, isbn))
     if cur.fetchone() is not None:
         print(f"You already have a reservation for ISBN {isbn}.")
+        return
+
+    # 新增检查：如果该会员已经借走这本书且未归还，则不允许预约
+    cur.execute("""
+        SELECT 1
+        FROM public.borrow
+        WHERE memberid = %s AND isbn = %s AND returndate IS NULL
+    """, (member_id, isbn))
+    if cur.fetchone() is not None:
+        print("You have already borrowed this book and have not returned it yet. Reservation not allowed.")
         return
 
     # 检查书籍是否存在
@@ -328,6 +356,8 @@ def reserve_book(conn, member_id):
     except Exception as e:
         conn.rollback()
         print("Failed to reserve book:", e)
+
+
 
 def cancel_reservation(conn, member_id):
     cur = conn.cursor()
@@ -368,7 +398,7 @@ def borrow_book(conn, member_id):
     
     isbn = input("Enter ISBN of the book you want to borrow: ").strip()
     
-    # 新增检查：判断该会员是否已经借阅该ISBN且未归还
+    # 检查该会员是否已经借阅该ISBN且未归还（防止重复借阅）
     cur.execute("""
         SELECT 1
         FROM public.borrow
@@ -377,8 +407,34 @@ def borrow_book(conn, member_id):
     if cur.fetchone() is not None:
         print("You have already borrowed this book and have not returned it yet.")
         return
-    
-    # 检查会员当前未归还的借阅数量
+
+    # 检查书籍是否存在以及当前书籍状态
+    cur.execute("SELECT status FROM public.book WHERE isbn = %s", (isbn,))
+    book = cur.fetchone()
+    if not book:
+        print("Book does not exist.")
+        return
+
+    # 先检查是否有预约记录标记为 Reserved（即预约优先的情况）
+    cur.execute("""
+        SELECT memberid
+        FROM public.reservation
+        WHERE isbn = %s 
+          AND status = 'Reserved'
+          AND pickupdeadline IS NOT NULL
+          AND pickupdeadline > CURRENT_TIMESTAMP
+        ORDER BY queuenumber ASC
+        LIMIT 1
+    """, (isbn,))
+    reserved = cur.fetchone()
+    if reserved:
+        # 如果有预约，且当前会员不是被预约的那位，则禁止借书
+        if reserved[0] != member_id:
+            print("This book is reserved for another member.")
+            return
+        # 否则当前会员就是预约者，可以借书
+
+    # 进一步检查借阅数量限制
     cur.execute("""
         SELECT COUNT(borrowid)
         FROM public.borrow 
@@ -389,30 +445,8 @@ def borrow_book(conn, member_id):
         print("You already have 5 active borrowed books. Please return some books before borrowing more.")
         return
 
-    # 检查书籍是否存在
-    cur.execute("SELECT status FROM public.book WHERE isbn = %s", (isbn,))
-    book = cur.fetchone()
-    if not book:
-        print("Book does not exist.")
-        return
-    
-    # 如果书籍处于不可借状态，则检查预约情况
-    if book[0] == "Unavailable":
-        cur.execute("""
-            SELECT memberid
-            FROM public.reservation
-            WHERE isbn = %s AND status = 'Reserved' 
-              AND pickupdeadline IS NOT NULL AND pickupdeadline > CURRENT_TIMESTAMP
-            ORDER BY queuenumber ASC
-            LIMIT 1
-        """, (isbn,))
-        res = cur.fetchone()
-        if res is None or res[0] != member_id:
-            print("Book is reserved for another member.")
-            return
-    
     try:
-        # 插入借阅记录，并利用触发器自动分配一个可用影本
+        # 插入借阅记录，并依赖触发器自动分配一个可用影本
         cur.execute("""
             INSERT INTO public.borrow 
             (memberid, isbn, borrowdate, duedate, returndate, createdat, updatedat)
@@ -424,7 +458,12 @@ def borrow_book(conn, member_id):
         print(f"Book borrowed successfully. Borrow ID: {result[0]}, Assigned Copy ID: {result[1]}")
     except Exception as e:
         conn.rollback()
-        print("Failed to borrow book:", e)
+        # 检查异常信息，如果包含“No available copy”，则输出友好提示
+        if "No available copy" in str(e):
+            print("There is no available copy of the book at this time.")
+        else:
+            print("Failed to borrow book. Please try again later.")
+
 
 def return_book(conn, member_id):
     cur = conn.cursor()
@@ -574,65 +613,66 @@ def search_books(conn):
     print("5. All (search in title, year, author and category)")
     search_type = input("Enter your choice: ").strip()
 
+    # 根据搜索类型构造查询条件和参数
     if search_type == "1":
-        query = "SELECT isbn, title, publishyear, status FROM public.book WHERE title ILIKE %s"
+        filter_clause = "b.title ILIKE %s"
         params = (f"%{keyword}%",)
     elif search_type == "2":
-        query = """
-            SELECT DISTINCT b.isbn, b.title, b.publishyear, b.status 
-            FROM public.book b 
-            JOIN public.book_category bc ON b.isbn = bc.isbn 
-            JOIN public.category c ON bc.categoryid = c.categoryid 
-            WHERE c.name ILIKE %s
-        """
+        filter_clause = "c.name ILIKE %s"
         params = (f"%{keyword}%",)
     elif search_type == "3":
-        query = "SELECT isbn, title, publishyear, status FROM public.book WHERE CAST(publishyear AS TEXT) ILIKE %s"
+        filter_clause = "CAST(b.publishyear AS TEXT) ILIKE %s"
         params = (f"%{keyword}%",)
     elif search_type == "4":
-        query = """
-            SELECT DISTINCT b.isbn, b.title, b.publishyear, b.status 
-            FROM public.book b 
-            JOIN public.book_author ba ON b.isbn = ba.isbn 
-            JOIN public.author a ON ba.authorid = a.authorid 
-            WHERE a.name ILIKE %s
-        """
+        filter_clause = "a.name ILIKE %s"
         params = (f"%{keyword}%",)
     elif search_type == "5":
-        query = """
-            SELECT DISTINCT b.isbn, b.title, b.publishyear, b.status 
-            FROM public.book b
-            LEFT JOIN public.book_author ba ON b.isbn = ba.isbn
-            LEFT JOIN public.author a ON ba.authorid = a.authorid
-            LEFT JOIN public.book_category bc ON b.isbn = bc.isbn
-            LEFT JOIN public.category c ON bc.categoryid = c.categoryid
-            WHERE b.title ILIKE %s 
-               OR CAST(b.publishyear AS TEXT) ILIKE %s 
-               OR a.name ILIKE %s 
-               OR c.name ILIKE %s
-        """
+        filter_clause = "b.title ILIKE %s OR CAST(b.publishyear AS TEXT) ILIKE %s OR a.name ILIKE %s OR c.name ILIKE %s"
         params = (f"%{keyword}%", f"%{keyword}%", f"%{keyword}%", f"%{keyword}%")
     else:
         print("Invalid search type.")
         return
 
+    # 查询书籍详细信息，包括作者和类别（使用 string_agg 聚合函数拼接多个值）
+    query = f"""
+        SELECT b.isbn, b.title, b.publishyear, b.status,
+               COALESCE(string_agg(DISTINCT a.name, ', '), 'N/A') as authors,
+               COALESCE(string_agg(DISTINCT c.name, ', '), 'N/A') as categories
+        FROM public.book b
+        LEFT JOIN public.book_author ba ON b.isbn = ba.isbn
+        LEFT JOIN public.author a ON ba.authorid = a.authorid
+        LEFT JOIN public.book_category bc ON b.isbn = bc.isbn
+        LEFT JOIN public.category c ON bc.categoryid = c.categoryid
+        WHERE {filter_clause}
+        GROUP BY b.isbn, b.title, b.publishyear, b.status
+        ORDER BY b.title
+    """
+    
     try:
         cur.execute(query, params)
         rows = cur.fetchall()
         if rows:
             print("\n=== Search Results ===")
             for row in rows:
-                isbn, title, publishyear, status = row
-                print(f"ISBN: {isbn}, Title: {title}, Year: {publishyear}, Status: {status}")
+                isbn, title, publishyear, status, authors, categories = row
+                print(f"ISBN: {isbn}")
+                print(f"Title: {title}")
+                print(f"Year: {publishyear}")
+                print(f"Status: {status}")
+                print(f"Authors: {authors}")
+                print(f"Categories: {categories}")
+                print("-" * 40)
         else:
             print("No books found matching the search criteria.")
     except Exception as e:
         print("Search failed:", e)
     print()
+
+
 def delete_book_copy(conn, employee_id):
     cur = conn.cursor()
-    print("\n=== Delete a Book Copy ===")
-    isbn = input("Enter ISBN for which you want to delete a copy: ").strip()
+    print("\n=== Delete Book Copies ===")
+    isbn = input("Enter ISBN for which you want to delete copies: ").strip()
     
     # 查询该 ISBN 的所有影本及其状态
     cur.execute("SELECT copyid, status FROM public.bookcopy WHERE isbn = %s", (isbn,))
@@ -642,31 +682,48 @@ def delete_book_copy(conn, employee_id):
         print("No copies found for this ISBN.")
         return
     
-    print("Copies for the book:")
-    for i, (copyid, status) in enumerate(copies, 1):
-        print(f"{i}. CopyID: {copyid}, Status: {status}")
+    print("Copies for the book (only those with status 'Available' can be deleted):")
+    for copyid, status in copies:
+        print(f"CopyID: {copyid}, Status: {status}")
     
-    choice = input("Enter the number of the copy to mark as Unavailable: ").strip()
-    try:
-        choice_index = int(choice) - 1
-        if choice_index < 0 or choice_index >= len(copies):
-            print("Invalid selection.")
-            return
-    except ValueError:
-        print("Invalid input.")
+    # 输入要删除的影本ID，多个ID用逗号分隔
+    input_ids = input("Enter the copy IDs to mark as Unavailable (comma separated): ").strip()
+    if not input_ids:
+        print("No copy IDs provided. Operation cancelled.")
         return
     
-    selected_copyid = copies[choice_index][0]
-    
     try:
-        # 将选中的影本状态更新为 Unavailable
-        cur.execute("""
-            UPDATE public.bookcopy
-            SET status = 'Unavailable', updatedat = CURRENT_TIMESTAMP
-            WHERE copyid = %s
-        """, (selected_copyid,))
-        
-        # 更新 book 表状态：如果没有 Available 的影本，则更新为 Unavailable
+        copy_ids = [int(x.strip()) for x in input_ids.split(",") if x.strip()]
+    except ValueError:
+        print("Invalid input: Copy IDs must be numeric.")
+        return
+    
+    updated_ids = []
+    skipped_ids = []
+    
+    for cid in copy_ids:
+        # 查询该 copyID 对应的状态，并确保它属于该ISBN
+        cur.execute("SELECT status FROM public.bookcopy WHERE copyid = %s AND isbn = %s", (cid, isbn))
+        result = cur.fetchone()
+        if not result:
+            skipped_ids.append((cid, "Not found"))
+        else:
+            status = result[0]
+            if status != "Available":
+                skipped_ids.append((cid, f"Current status is '{status}'"))
+            else:
+                try:
+                    cur.execute("""
+                        UPDATE public.bookcopy
+                        SET status = 'Unavailable', updatedat = CURRENT_TIMESTAMP
+                        WHERE copyid = %s
+                    """, (cid,))
+                    updated_ids.append(cid)
+                except Exception as e:
+                    skipped_ids.append((cid, f"Update error: {e}"))
+    
+    # 更新 book 表的状态（依据该 ISBN 下是否还存在 'Available' 的影本）
+    try:
         cur.execute("""
             WITH status_summary AS (
                 SELECT COUNT(*) AS available_count
@@ -681,12 +738,18 @@ def delete_book_copy(conn, employee_id):
             updatedat = CURRENT_TIMESTAMP
             WHERE isbn = %s
         """, (isbn, isbn))
-        
         conn.commit()
-        print(f"Book copy with ID {selected_copyid} marked as Unavailable.")
     except Exception as e:
         conn.rollback()
-        print("Failed to update book copy:", e)
+        print("Failed to update book status:", e)
+        return
+
+    if updated_ids:
+        print(f"Book copies with IDs {updated_ids} have been marked as Unavailable.")
+    if skipped_ids:
+        for cid, reason in skipped_ids:
+            print(f"Book copy with ID {cid} was not updated: {reason}")
+
 
 
 def browse_borrow_records(conn):
@@ -917,6 +980,56 @@ def show_member_reservations(conn, member_id):
             print(f"ReservationID: {reservationid}, ISBN: {isbn}, Status: {status}, Reservation Date: {reservationdate}, Queue Number: {queuenumber}, Pickup Deadline: {pickupdeadline}")
     else:
         print("\nYou have not reserved any books.")
+def update_book_info(conn, employee_id):
+    cur = conn.cursor()
+    print("\n=== Update Book Information ===")
+    isbn = input("Enter ISBN of the book you want to update: ").strip()
+    
+    # 检查该书是否存在
+    cur.execute("SELECT isbn, title, publishyear, area, status FROM public.book WHERE isbn = %s", (isbn,))
+    book = cur.fetchone()
+    if not book:
+        print("Book does not exist.")
+        return
+    
+    # 显示当前信息
+    print("Current information:")
+    print(f"ISBN: {book[0]}, Title: {book[1]}, Publish Year: {book[2]}, Area: {book[3]}, Status: {book[4]}")
+    
+    # 获取需要更新的字段，新值为空则保持原值
+    new_title = input("Enter new title (leave blank to keep current): ").strip()
+    new_publishyear = input("Enter new publish year (leave blank to keep current): ").strip()
+    new_area = input("Enter new area (leave blank to keep current): ").strip()
+    
+    # 构造动态更新语句
+    fields = []
+    params = []
+    if new_title:
+        fields.append("title = %s")
+        params.append(new_title)
+    if new_publishyear:
+        fields.append("publishyear = %s")
+        params.append(new_publishyear)
+    if new_area:
+        fields.append("area = %s")
+        params.append(new_area)
+    
+    if not fields:
+        print("No changes provided. Update canceled.")
+        return
+    
+    # 更新updatedat字段记录最后修改时间
+    update_query = "UPDATE public.book SET " + ", ".join(fields) + ", updatedat = CURRENT_TIMESTAMP WHERE isbn = %s"
+    params.append(isbn)
+    
+    try:
+        cur.execute(update_query, params)
+        conn.commit()
+        print("Book information updated successfully.")
+    except Exception as e:
+        conn.rollback()
+        print("Failed to update book information:", e)
+
 def main():
     conn = get_connection()
     while True:
