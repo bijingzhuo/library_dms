@@ -33,10 +33,9 @@ def login():
 
     if role == "employee":
         query = "SELECT name FROM public.employee WHERE employeeid = %s AND password = %s"
-    else:
-        query = "SELECT name FROM public.member WHERE memberid = %s AND password = %s"
-
-    cur.execute(query, (user_id, password))
+    else:  
+        query = "SELECT name FROM public.member WHERE memberid = %s AND password = %s AND membershipstatus = 'Active'"
+        cur.execute(query, (user_id, password))
     result = cur.fetchone()
     cur.close()
     conn.close()
